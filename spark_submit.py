@@ -1,34 +1,28 @@
-'''
-Author:      venkatesh
-Project:     stocks realtime analysis through spark structured streaming using docker
-Date:        6/01/2023
-
-'''
-
-
 from pyspark.sql.session import SparkSession
 from pyspark.sql.functions import *
-# from pyspark.sql.types import *
-from os import *
-# from pyspark.conf import SparkConf
 import psycopg2
 
+# Initialize Spark session
 spark = SparkSession.builder.appName("KafkaDataViewer").getOrCreate()
 
+# Set log level and Spark configuration
 spark.sparkContext.setLogLevel("ERROR")
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
+# Read data from Kafka
 df = spark \
     .readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("kafka.bootstrap.servers", "kafka:29092") \
     .option("subscribe", "venkat_stream") \
     .load()
 
+# Cast the Kafka message to string
 df1 = df.selectExpr("CAST(value AS STRING)")
 
-df2 = df1.withColumn("Body", regexp_replace("value", "\"", ""))
-
-df3 = df2.withColumn("actual", split(df2.Body, ",")) \
+# Clean and process the data
+df3 = df1.withColumn("Body", regexp_replace("value", "\"", "")) \
+    .withColumn("actual", split(col("Body"), ",")) \
     .withColumn("Timestamp", to_timestamp(col("actual").getItem(0), "yyyy-MM-dd HH:mm:ss").cast("Timestamp")) \
     .withColumn("Bank_Name", col("actual").getItem(1)) \
     .withColumn("Open", col("actual").getItem(2).cast("decimal(38, 0)")) \
@@ -39,33 +33,45 @@ df3 = df2.withColumn("actual", split(df2.Body, ",")) \
 
 df4 = df3.select("Timestamp", "Bank_Name", "Open", "High", "Low", "Close", "Volume")
 
+# Print schema to verify data
 df4.printSchema()
 
-
+# Class to handle writing data to PostgreSQL
 class AggInsertTimeDB:
     def process(self, row):
-        StartTime = str(row.StartTime)
-        EndTime = str(row.EndTime)
-        Bank_Name = row.Bank_Name
-        Open = row.Avg_OpenPrice
-        High = row.Avg_HighPrice
-        Low = row.Avg_LowPrice
-        Close = row.Avg_ClosePrice
-        Volume = row.Avg_Volume
+        # Use asDict to extract row fields as a dictionary
+        row_dict = row.asDict()
+
+        # Extract fields from the row_dict
+        StartTime = str(row_dict['StartTime'])  # Use the column name 'StartTime'
+        EndTime = str(row_dict['EndTime'])  # Use the column name 'EndTime'
+        Bank_Name = row_dict['Bank_Name']
+        Open = row_dict['Avg_OpenPrice']
+        High = row_dict['Avg_HighPrice']
+        Low = row_dict['Avg_LowPrice']
+        Close = row_dict['Avg_ClosePrice']
+        Volume = row_dict['Avg_Volume']
+        
         try:
+            # PostgreSQL connection
             connection = psycopg2.connect(user="postgres",
                                           password="postgres",
-                                          host="0.0.0.0",
+                                          host="Timescale_DB",                                          
                                           port="5432",
                                           database="demo_streaming")
             cursor = connection.cursor()
 
-            sql_insert_query = """ INSERT INTO venkat_demo (StartTime, EndTime, Bank_Name, Avg_OpenPrice, Avg_HighPrice, Avg_LowPrice, Avg_ClosePrice, Avg_Volume) VALUES ('%s, '%s, '%s, '%d', '%d, '%d', '%d', '%d')""" % (StartTime, EndTime, Bank_Name, Open, High, Low, Close, Volume)
+            # Corrected SQL query with formatted strings
+            sql_insert_query = """
+            INSERT INTO venkat_demo (StartTime, EndTime, Bank_Name, Avg_OpenPrice, Avg_HighPrice, Avg_LowPrice, Avg_ClosePrice, Avg_Volume)
+            VALUES ('%s', '%s', '%s', %s, %s, %s, %s, %s)
+            """ % (StartTime, EndTime, Bank_Name, Open, High, Low, Close, Volume)
 
             print("\nsql_insert_query ", sql_insert_query)
-            result = cursor.execute(sql_insert_query)
-            result.commit()
+            cursor.execute(sql_insert_query)
+            connection.commit()
             print(cursor.rowcount, "Record inserted successfully into venkat_demo table")
+
         except (Exception, psycopg2.Error) as error:
             print("Failed inserting record into table {}".format(error))
         finally:
@@ -74,17 +80,34 @@ class AggInsertTimeDB:
                 connection.close()
 
 
-dfWindowed = df4.groupBy(window(df4.Timestamp, "5 seconds", "2 seconds"), df4.Bank_Name).mean().orderBy('window') \
-    .select(col("window.start").alias("StartTime"), col("window.end").alias("EndTime"), "Bank_Name", col("avg(Open)").alias("Avg_OpenPrice"),
-            col("avg(High)").alias("Avg_HighPrice"), col("avg(Low)").alias("Avg_LowPrice"),
-            col("avg(Close)").alias("Avg_ClosePrice"), col("avg(Volume)").alias("Avg_Volume"))
+# Windowed aggregation: Group by time window and Bank_Name
+dfWindowed = df4.groupBy(window(df4.Timestamp, "5 seconds", "2 seconds"), df4.Bank_Name) \
+    .mean().orderBy('window') \
+    .select(
+        col("window.start").alias("StartTime"), 
+        col("window.end").alias("EndTime"), 
+        "Bank_Name", 
+        col("avg(Open)").alias("Avg_OpenPrice"),
+        col("avg(High)").alias("Avg_HighPrice"), 
+        col("avg(Low)").alias("Avg_LowPrice"),
+        col("avg(Close)").alias("Avg_ClosePrice"), 
+        col("avg(Volume)").alias("Avg_Volume")
+    )
 
+# Print schema for windowed aggregation
 print("dfWindowed schema")
 dfWindowed.printSchema()
 
+# Write the output to console for debugging
 df4.writeStream.format("console").outputMode("append").option('truncate', 'false').start()
+
+# Write windowed data to PostgreSQL
+dfWindowed.writeStream.foreach(AggInsertTimeDB()).outputMode("complete").option('truncate', 'false').start()
+
+# Write the windowed data to console
 dfWindowed.writeStream.format("console").outputMode("complete").option('truncate', 'false').start().awaitTermination()
 
+# Instructions for running Spark jobs
 # ---> to run in yarn cluster
 # spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.0.0 --master yarn spark_submit.py
 
